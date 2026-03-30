@@ -1,262 +1,205 @@
-
-   #!/usr/bin/env python3
+#!/usr/bin/env python3
 
 import os
 import json
 import time
-import logging
 import asyncio
 import urllib.request
-from datetime import datetime, timezone
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
+from collections import defaultdict
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
-# ────────────────────────────────────────────────
-# CONFIG
-# ────────────────────────────────────────────────
-
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-SITE_BASE = "https://cyb3rr00t.tech"
+API = "https://cyb3rr00t.tech/api/trx-data"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
-    "Referer": SITE_BASE + "/",
-    "Accept": "application/json",
+    "Accept": "application/json"
 }
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+auto_chats = set()
+last_issue = ""
 
-auto_alert_chats = set()
-last_seen_issue = ""
-
-# ────────────────────────────────────────────────
+# ─────────────────────────────
 # FETCH
-# ────────────────────────────────────────────────
+# ─────────────────────────────
 
-def fetch_json(url: str):
+def fetch():
+    url = f"{API}?t={int(time.time()*1000)}"
     req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read())
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
 
 async def fetch_async():
-    t = int(time.time() * 1000)
-    url = f"{SITE_BASE}/api/trx-data?t={t}"
-    return await asyncio.get_event_loop().run_in_executor(None, lambda: fetch_json(url))
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, fetch)
 
-# ────────────────────────────────────────────────
+# ─────────────────────────────
 # HELPERS
-# ────────────────────────────────────────────────
-
-def short_issue(s):
-    return s[-6:]
+# ─────────────────────────────
 
 def result_of(n):
     return "BIG" if n >= 5 else "SMALL"
 
-def dir_emoji(d):
-    return "🟢 BIG" if d == "BIG" else "🔴 SMALL" if d == "SMALL" else "⚪ VOID"
+def short(s):
+    return s[-6:]
 
-# ────────────────────────────────────────────────
-# HASH AI MODEL
-# ────────────────────────────────────────────────
+# ─────────────────────────────
+# BUILD MODEL (WINRATE PER KEY)
+# ─────────────────────────────
 
-def build_hash_model(history):
-    model = {}
-    digit_map = {}
+def build_model(history):
+    model = defaultdict(lambda: {"BIG": 0, "SMALL": 0})
 
     for i in range(len(history) - 1):
         curr = history[i]
         nxt = history[i + 1]
 
-        num = int(curr["number"])
         h = curr.get("hash", "") or curr.get("blockHash", "")
         if not h:
             continue
 
-        digit = h[-1]
-        nxt_result = result_of(int(nxt["number"]))
+        num = int(curr["number"])
+        digit = h[-1].lower()
 
         key = f"{num}_{digit}"
 
-        if key not in model:
-            model[key] = {"BIG": 0, "SMALL": 0}
-        model[key][nxt_result] += 1
+        nxt_res = result_of(int(nxt["number"]))
+        model[key][nxt_res] += 1
 
-        if digit not in digit_map:
-            digit_map[digit] = {"BIG": 0, "SMALL": 0}
-        digit_map[digit][nxt_result] += 1
+    return model
 
-    return model, digit_map
+# ─────────────────────────────
+# PREDICT
+# ─────────────────────────────
 
-
-def hash_predict(history, model):
-    if not history:
-        return "VOID", 0, 50
-
+def predict(history, model):
     curr = history[-1]
+
     num = int(curr["number"])
     h = curr.get("hash", "") or curr.get("blockHash", "")
 
     if not h:
-        return "VOID", 0, 50
+        return "VOID", 0, 0, "NO_HASH"
 
-    digit = h[-1]
+    digit = h[-1].lower()
     key = f"{num}_{digit}"
 
-    if key not in model:
-        return "VOID", 0, 50
+    stats = model.get(key)
 
-    big = model[key]["BIG"]
-    small = model[key]["SMALL"]
+    if not stats:
+        return "VOID", 0, 0, key
+
+    big = stats["BIG"]
+    small = stats["SMALL"]
     total = big + small
 
-    if total < 5:
-        return "VOID", total, 50
+    if total < 3:
+        return "VOID", 50, total, key
 
     if big > small:
-        return "BIG", total, int(big / total * 100)
+        return "BIG", int(big/total*100), total, key
     else:
-        return "SMALL", total, int(small / total * 100)
+        return "SMALL", int(small/total*100), total, key
 
+# ─────────────────────────────
+# TELEGRAM COMMAND
+# ─────────────────────────────
 
-def build_heatmap(digit_map):
-    lines = []
+async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("⏳ Loading...")
 
-    for d in sorted(digit_map.keys()):
-        big = digit_map[d]["BIG"]
-        small = digit_map[d]["SMALL"]
-        total = big + small
+    try:
+        history = await fetch_async()
 
-        if total == 0:
-            continue
+        model = build_model(history)
+        direction, confidence, samples, key = predict(history, model)
 
-        big_pct = int(big / total * 100)
-        small_pct = 100 - big_pct
+        last = history[-1]
+        num = int(last["number"])
+        res = result_of(num)
 
-        lines.append(f"{d} → 🟢 {big_pct}% | 🔴 {small_pct}%")
+        text = (
+            f"🤖 *HASH AI BOT*\n\n"
+            f"Key: `{key}`\n"
+            f"Issue: `{short(last['issueNumber'])}`\n"
+            f"Result: `{num}` → *{res}*\n\n"
+            f"Prediction: *{direction}*\n"
+            f"Confidence: *{confidence}%*\n"
+            f"Samples: `{samples}`\n\n"
+            f"_Auto-learning hash model_"
+        )
 
-    return "\n".join(lines)
+        await msg.delete()
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-# ────────────────────────────────────────────────
-# ANALYSIS
-# ────────────────────────────────────────────────
+    except Exception as e:
+        await msg.edit_text(f"Error: {e}")
 
-def analyze(history):
-    model, digit_map = build_hash_model(history)
+# ─────────────────────────────
+# AUTO WATCHER (ONLY STRONG)
+# ─────────────────────────────
 
-    direction, samples, confidence = hash_predict(history, model)
+async def watcher(context: ContextTypes.DEFAULT_TYPE):
+    global last_issue
 
-    last = history[-1]
+    try:
+        history = await fetch_async()
+        latest = history[-1]["issueNumber"]
 
-    results = [result_of(int(h["number"])) for h in history[-20:]]
-    visual = "".join("🟢" if r == "BIG" else "🔴" for r in results)
+        if latest == last_issue:
+            return
 
-    return {
-        "issue": short_issue(last["issueNumber"]),
-        "next": str(int(short_issue(last["issueNumber"])) + 1).zfill(6),
-        "num": int(last["number"]),
-        "res": result_of(int(last["number"])),
-        "direction": direction,
-        "confidence": confidence,
-        "samples": samples,
-        "visual": visual,
-        "heatmap": build_heatmap(digit_map),
-    }
+        last_issue = latest
 
-# ────────────────────────────────────────────────
-# MESSAGE
-# ────────────────────────────────────────────────
+        model = build_model(history)
+        direction, confidence, samples, key = predict(history, model)
 
-def build_message(d):
-    return (
-        f"🤖 *HASH AI PREDICT*\n\n"
-        f"Issue `{d['issue']}` → `{d['next']}`\n"
-        f"Result `{d['num']}` → *{d['res']}*\n\n"
-        f"Direction: *{dir_emoji(d['direction'])}*\n"
-        f"Confidence: *{d['confidence']}%*\n"
-        f"Samples: `{d['samples']}`\n\n"
-        f"Last 20:\n{d['visual']}\n\n"
-        f"Heatmap:\n{d['heatmap']}"
-    )
+        # 🎯 ONLY STRONG SIGNALS
+        if samples < 5 or confidence < 60:
+            return
 
-# ────────────────────────────────────────────────
-# TELEGRAM
-# ────────────────────────────────────────────────
+        last = history[-1]
+        num = int(last["number"])
+        res = result_of(num)
 
-def keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔮 Predict", callback_data="p")],
-        [InlineKeyboardButton("🔔 Auto ON", callback_data="on"),
-         InlineKeyboardButton("🔕 Auto OFF", callback_data="off")]
-    ])
+        text = (
+            f"🚨 *STRONG SIGNAL*\n\n"
+            f"Key: `{key}`\n"
+            f"Issue: `{short(last['issueNumber'])}`\n"
+            f"Result: `{num}` → *{res}*\n\n"
+            f"Next: *{direction}* ({confidence}%)\n"
+            f"Samples: `{samples}`"
+        )
 
-async def predict(update, context):
-    msg = update.message or update.callback_query.message
+        for chat_id in auto_chats:
+            await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN)
 
-    wait = await msg.reply_text("⏳ Loading...")
-    data = await fetch_async()
+    except Exception as e:
+        print("Watcher error:", e)
 
-    result = analyze(data)
-    await wait.delete()
+# ─────────────────────────────
+# COMMANDS
+# ─────────────────────────────
 
-    await msg.reply_text(build_message(result), parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard())
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    auto_chats.add(update.message.chat_id)
+    await update.message.reply_text("✅ Bot Started — Auto alerts ON")
 
-async def start(update, context):
-    await update.message.reply_text("HASH AI BOT READY", reply_markup=keyboard())
-
-async def button(update, context):
-    q = update.callback_query
-    await q.answer()
-
-    if q.data == "p":
-        await predict(update, context)
-    elif q.data == "on":
-        auto_alert_chats.add(q.message.chat_id)
-    elif q.data == "off":
-        auto_alert_chats.discard(q.message.chat_id)
-
-# ────────────────────────────────────────────────
-# WATCHER
-# ────────────────────────────────────────────────
-
-async def watcher(context):
-    global last_seen_issue
-
-    data = await fetch_async()
-    latest = data[-1]["issueNumber"]
-
-    if latest == last_seen_issue:
-        return
-
-    last_seen_issue = latest
-
-    result = analyze(data)
-    text = build_message(result)
-
-    for chat_id in auto_alert_chats:
-        await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN)
-
-# ────────────────────────────────────────────────
+# ─────────────────────────────
 # MAIN
-# ────────────────────────────────────────────────
+# ─────────────────────────────
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("predict", predict))
-    app.add_handler(CallbackQueryHandler(button))
+    app.add_handler(CommandHandler("predict", cmd_predict))
 
     app.job_queue.run_repeating(watcher, interval=15, first=5)
 
+    print("🚀 Hash AI Bot Running...")
     app.run_polling()
 
 if __name__ == "__main__":
